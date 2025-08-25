@@ -1,0 +1,9 @@
+[esp32c3_sensor_mq_publ]
+#mqtt_user = "horse"
+#mqtt_pass = "CorrectHorseBatteryStaple"
+#mqtt_host = "test.mosquitto.org"
+
+#wifi_ssid = "WLANBOX"
+#wifi_psk = "BIGSECRET"
+
+
