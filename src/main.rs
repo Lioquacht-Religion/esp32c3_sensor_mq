@@ -1,9 +1,10 @@
 use anyhow::Result;
+use bme280::{i2c::BME280, Measurements};
 use embedded_svc::mqtt::client::QoS;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{
-        delay,
+        delay::Delay,
         i2c::{I2cConfig, I2cDriver},
         prelude::*,
         temp_sensor::{TempSensorConfig, TempSensorDriver},
@@ -11,13 +12,13 @@ use esp_idf_svc::{
     mqtt::client::{EspMqttClient, MqttClientConfiguration},
 };
 use log::info;
-use mqtt_messages::hello_topic;
-use wifi::wifi;
+use schili_api::mq_topics::{chip_temperature_topic, hello_topic, sensor_temperature_topic};
 use std::{thread::sleep, time::Duration};
+use wifi::wifi;
 
 mod wifi;
 
-const UUID: &str = get_uuid::uuid();
+const UUID: &str = "42"; //get_uuid::uuid();
 
 #[toml_cfg::toml_config]
 pub struct Config {
@@ -54,6 +55,11 @@ fn main() -> Result<()> {
     info!("Our UUID is:");
     info!("{}", UUID);
 
+    let tps_config = TempSensorConfig::default();
+    let mut tp_driver = TempSensorDriver::new(&tps_config, peripherals.temp_sensor).unwrap();
+
+    tp_driver.enable().unwrap();
+
     let pins = peripherals.pins;
     let sda = pins.gpio6;
     let scl = pins.gpio7;
@@ -61,17 +67,12 @@ fn main() -> Result<()> {
     let config = I2cConfig::new().baudrate(100.kHz().into());
     let i2c = I2cDriver::new(i2c, sda, scl, &config)?;
 
-    let tps_config = TempSensorConfig::default();
-    let mut tp_driver = TempSensorDriver::new(&tps_config, peripherals.temp_sensor).unwrap();
+    let mut bme280_sensor = BME280::new_primary(i2c);
+    let mut delay = Delay::new(10);
 
-    tp_driver.enable().unwrap();
-
-    let mut delay = delay::Ets;
-
-    /*
-    let mut led = WS2812RMT::new(pins.gpio2, peripherals.rmt.channel0)?;
-    led.set_pixel(RGB8::new(1, 1, 0))?;
-    */
+    if let Err(e) = bme280_sensor.init(&mut delay) {
+        panic!("bme280 sensor init failed for I2C!: error: {:?}", e);
+    }
 
     // Client configuration:
     let broker_url = if app_config.mqtt_user != "" {
@@ -99,14 +100,30 @@ fn main() -> Result<()> {
     loop {
         sleep(Duration::from_secs(1));
         let temp_val = tp_driver.get_celsius().unwrap();
+        info!("chip temperature: {}", temp_val);
 
         // 3. publish CPU temperature
         // client.publish( ... )?;
         client.enqueue(
-            &mqtt_messages::temperature_data_topic(UUID),
+            &chip_temperature_topic(UUID),
             QoS::AtLeastOnce,
             false,
             &temp_val.to_be_bytes() as &[u8],
         )?;
+
+        match bme280_sensor.measure(&mut delay) {
+            Ok(Measurements { temperature, .. }) => {
+                info!("sensor temperature: {}", temperature);
+                client.enqueue(
+                    &sensor_temperature_topic(UUID),
+                    QoS::AtLeastOnce,
+                    false,
+                    &temperature.to_be_bytes() as &[u8],
+                )?;
+            }
+            Err(e) => {
+                info!("bme280 measurement error: {:?}", e);
+            }
+        }
     }
 }
