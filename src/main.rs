@@ -1,5 +1,7 @@
 use anyhow::Result;
+use bigdecimal::{BigDecimal, FromPrimitive};
 use bme280::{i2c::BME280, Measurements};
+use chrono::Utc;
 use embedded_svc::mqtt::client::QoS;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
@@ -12,7 +14,7 @@ use esp_idf_svc::{
     mqtt::client::{EspMqttClient, MqttClientConfiguration},
 };
 use log::info;
-use schili_api::mq_topics::{chip_temperature_topic, hello_topic, sensor_temperature_topic};
+use schili_api::{api, mq_topics::{chip_temperature_topic, hello_topic, sensor_temperature_topic}};
 use std::{thread::sleep, time::Duration};
 use wifi::wifi;
 
@@ -114,12 +116,26 @@ fn main() -> Result<()> {
         match bme280_sensor.measure(&mut delay) {
             Ok(Measurements { temperature, .. }) => {
                 info!("sensor temperature: {}", temperature);
-                client.enqueue(
-                    &sensor_temperature_topic(UUID),
-                    QoS::AtLeastOnce,
-                    false,
-                    &temperature.to_be_bytes() as &[u8],
-                )?;
+
+                let temp = api::TemperatureMeasurement {
+                    temp_celsius: BigDecimal::from_f32(temperature).expect("f32 could not be parsed to BigDecimal."),
+                    measure_time: Utc::now(),
+                };
+                let sens_temps = api::SensorTempMeasurements {
+                    sensor_reference: "bme280_1".into(),
+                    temp_measurements: vec![
+                        temp
+                    ],
+                };
+
+                if let Ok(sens_temps_str) = serde_json::to_string(&sens_temps) {
+                    client.enqueue(
+                        &sensor_temperature_topic(UUID),
+                        QoS::AtLeastOnce,
+                        false,
+                        &sens_temps_str.as_bytes()
+                    )?;
+                }
             }
             Err(e) => {
                 info!("bme280 measurement error: {:?}", e);
