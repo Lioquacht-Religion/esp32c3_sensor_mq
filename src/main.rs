@@ -1,24 +1,22 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bme280::{i2c::BME280, Measurements};
+use esp32c3_sensor_mq_publ::{mq135_2::{GasType, Mq135}, wifi::wifi};
 use chrono::Utc;
 use embedded_svc::mqtt::client::QoS;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{
-        delay::Delay,
-        i2c::{I2cConfig, I2cDriver},
-        prelude::*,
-        temp_sensor::{TempSensorConfig, TempSensorDriver},
+        adc::{attenuation::{DB_11, DB_2_5, DB_6, NONE}, oneshot::{config::{AdcChannelConfig, Calibration}, AdcChannelDriver, AdcDriver}, Attenuated, Resolution}, delay::Delay, gpio::{ADCPin, Pin, RTCPin}, i2c::{I2cConfig, I2cDriver}, prelude::*, temp_sensor::{TempSensorConfig, TempSensorDriver}
     },
     mqtt::client::{EspMqttClient, MqttClientConfiguration},
 };
 use log::info;
-use schili_api::{api, mq_topics::{chip_temperature_topic, hello_topic, sensor_temperature_topic}};
+use schili_api::{
+    api,
+    mq_topics::{chip_temperature_topic, sensor_co2_topic, sensor_temperature_topic},
+};
 use std::{thread::sleep, time::Duration};
-use wifi::wifi;
-
-mod wifi;
 
 const UUID: &str = "42"; //get_uuid::uuid();
 
@@ -60,7 +58,7 @@ fn main() -> Result<()> {
     let tps_config = TempSensorConfig::default();
     let mut tp_driver = TempSensorDriver::new(&tps_config, peripherals.temp_sensor).unwrap();
 
-    tp_driver.enable().unwrap();
+    tp_driver.enable()?;
 
     let pins = peripherals.pins;
     let sda = pins.gpio6;
@@ -75,6 +73,32 @@ fn main() -> Result<()> {
     if let Err(e) = bme280_sensor.init(&mut delay) {
         panic!("bme280 sensor init failed for I2C!: error: {:?}", e);
     }
+
+    info!("gpio4 adc channel: {}", pins.gpio4.adc_channel());
+
+    let adc = AdcDriver::new(peripherals.adc1).unwrap();
+    let adc_config = AdcChannelConfig{
+        attenuation: DB_11, 
+        calibration: Calibration::None,
+        resolution: Resolution::Resolution12Bit,
+        //..Default::default()
+    };
+
+    let mut adc_pin //: AdcChannelDriver<'_, AdcDriver<'_, ADC1>> 
+        = 
+        AdcChannelDriver::new(
+        &adc, pins.gpio4, &adc_config
+    ).unwrap();
+
+
+    let mut co2_sensor = Mq135::new(
+         20.0
+    ); // RL load resistance in kOhms
+
+        sleep(Duration::from_secs(1));
+        co2_sensor.calibrate_in_clean_air(&adc, &mut adc_pin).unwrap();
+        let (co2_ppm, adc_val) = co2_sensor.read_gas_ppm(GasType::CO2, &adc, &mut adc_pin).unwrap();
+        info!("CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_val);
 
     // Client configuration:
     let broker_url = if app_config.mqtt_user != "" {
@@ -95,51 +119,109 @@ fn main() -> Result<()> {
         // handler code
     })?;
 
-    // 2. publish an empty hello message
-    let payload: &[u8] = &[];
-    client.enqueue(&hello_topic(UUID), QoS::AtLeastOnce, true, payload)?;
-
     loop {
         sleep(Duration::from_secs(1));
-        let temp_val = tp_driver.get_celsius().unwrap();
-        info!("chip temperature: {}", temp_val);
+        publish_chip_temperature(&mut client, &tp_driver)?;
+        let (t, h) = publish_bme280_measurements(&mut client, &mut bme280_sensor, delay)?;
 
-        // 3. publish CPU temperature
-        // client.publish( ... )?;
-        client.enqueue(
-            &chip_temperature_topic(UUID),
-            QoS::AtLeastOnce,
-            false,
-            &temp_val.to_be_bytes() as &[u8],
-        )?;
+        let (co2_ppm, adc_val) = co2_sensor.read_gas_ppm(GasType::CO2, &adc, &mut adc_pin).unwrap();
+        info!("CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_val);
 
-        match bme280_sensor.measure(&mut delay) {
-            Ok(Measurements { temperature, .. }) => {
-                info!("sensor temperature: {}", temperature);
+        let adc_value: u32 = adc.read(&mut adc_pin)?.into();
+        publish_mq135_co2(&mut client, &co2_sensor, adc_value, t, h)?;
 
-                let temp = api::TemperatureMeasurement {
-                    temp_celsius: BigDecimal::from_f32(temperature).expect("f32 could not be parsed to BigDecimal."),
-                    measure_time: Utc::now(),
-                };
-                let sens_temps = api::SensorTempMeasurements {
-                    sensor_reference: "bme280_1".into(),
-                    temp_measurements: vec![
-                        temp
-                    ],
-                };
+    }
+}
 
-                if let Ok(sens_temps_str) = serde_json::to_string(&sens_temps) {
-                    client.enqueue(
+fn publish_mq135_co2(
+    client: &mut EspMqttClient,
+    co2_sensor: &Mq135,
+    adc_value: u32,
+    t: f32, h: f32
+) -> Result<()> {
+        let co2_ppm = co2_sensor.getPPM(adc_value);
+        info!("CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_value);
+        let co2_ppm = co2_sensor.getCorrectedPPM(adc_value, t, h);
+        info!("corrected CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_value);
+        let co2_measure = api::Co2Measurement{
+            co2_ppm: BigDecimal::from_f32(co2_ppm)
+                    .expect("f32 could not be parsed to BigDecimal."),
+            res0: BigDecimal::from_f32(co2_sensor.getRZero(adc_value))
+                    .expect("f32 could not be parsed to BigDecimal."),
+            adc_val: adc_value as i32,
+            measure_time: Utc::now(),
+        };
+        let sensor_co2_measure = api::SensorSingleCo2Measure { sensor_reference: "bme280_1".into(), co2_measure };
+            if let Ok(sens_temps_str) = serde_json::to_string(&sensor_co2_measure) {
+                client
+                    .enqueue(
+                        &sensor_co2_topic(UUID),
+                        QoS::AtLeastOnce,
+                        false,
+                        &sens_temps_str.as_bytes(),
+                    )
+                    .map_err(|e| anyhow!("Could not send bme280 temperature. error: {e}"))?;
+            }
+
+
+    Ok(())
+}
+
+fn publish_chip_temperature(
+    client: &mut EspMqttClient,
+    tp_driver: &TempSensorDriver,
+) -> Result<()> {
+    let temp_val = tp_driver
+        .get_celsius()
+        .map_err(|e| anyhow!("Could not access chip temperature. error: {e}"))?;
+    info!("chip temperature: {}", temp_val);
+
+    // 3. publish CPU temperature
+    // client.publish( ... )?;
+    client.enqueue(
+        &chip_temperature_topic(UUID),
+        QoS::AtLeastOnce,
+        false,
+        &temp_val.to_be_bytes() as &[u8],
+    )?;
+
+    Ok(())
+}
+
+fn publish_bme280_measurements(
+    client: &mut EspMqttClient,
+    bme280_sensor: &mut BME280<I2cDriver>,
+    mut delay: Delay,
+) -> Result<(f32, f32)> {
+    match bme280_sensor.measure(&mut delay) {
+        Ok(Measurements { temperature, humidity, .. }) => {
+            info!("sensor temperature: {}", temperature);
+
+            let temp = api::TemperatureMeasurement {
+                temp_celsius: BigDecimal::from_f32(temperature)
+                    .expect("f32 could not be parsed to BigDecimal."),
+                measure_time: Utc::now(),
+            };
+            let sens_temps = api::SensorSingleTempMeasure {
+                sensor_reference: "bme280_1".into(),
+                temp_measure: temp,
+            };
+
+            if let Ok(sens_temps_str) = serde_json::to_string(&sens_temps) {
+                client
+                    .enqueue(
                         &sensor_temperature_topic(UUID),
                         QoS::AtLeastOnce,
                         false,
-                        &sens_temps_str.as_bytes()
-                    )?;
-                }
+                        &sens_temps_str.as_bytes(),
+                    )
+                    .map_err(|e| anyhow!("Could not send bme280 temperature. error: {e}"))?;
             }
-            Err(e) => {
-                info!("bme280 measurement error: {:?}", e);
-            }
+            return Ok((temperature, humidity));
+        }
+        Err(e) => {
+            info!("bme280 measurement error: {:?}", e);
         }
     }
+    Ok((f32::NAN, f32::NAN))
 }
