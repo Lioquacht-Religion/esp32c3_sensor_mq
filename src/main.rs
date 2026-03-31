@@ -7,16 +7,16 @@ use embedded_svc::mqtt::client::QoS;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{
-        adc::{attenuation::{DB_11, DB_2_5, DB_6, NONE}, oneshot::{config::{AdcChannelConfig, Calibration}, AdcChannelDriver, AdcDriver}, Attenuated, Resolution}, delay::Delay, gpio::{ADCPin, Pin, RTCPin}, i2c::{I2cConfig, I2cDriver}, prelude::*, temp_sensor::{TempSensorConfig, TempSensorDriver}
+        adc::{attenuation::DB_11, oneshot::{config::{AdcChannelConfig, Calibration}, AdcChannelDriver, AdcDriver}, Resolution, ADC1}, delay::Delay, gpio::{ADCPin, Gpio4, Gpio6, Gpio7}, i2c::{I2cConfig, I2cDriver, I2C0}, prelude::*, temp_sensor::{TempSensorConfig, TempSensorDriver}
     },
-    mqtt::client::{EspMqttClient, MqttClientConfiguration},
+    mqtt::client::{EspMqttClient, MqttClientConfiguration}, sys::EspError,
 };
 use log::info;
 use schili_api::{
     api,
     mq_topics::{chip_temperature_topic, sensor_co2_topic, sensor_temperature_topic},
 };
-use std::{thread::sleep, time::Duration};
+use std::{borrow::Borrow, thread::sleep, time::Duration};
 
 const UUID: &str = "42"; //get_uuid::uuid();
 
@@ -32,6 +32,8 @@ pub struct Config {
     wifi_ssid: &'static str,
     #[default("")]
     wifi_psk: &'static str,
+    #[default(false)]
+    feature_co2_sensor_active: bool,
 }
 
 fn main() -> Result<()> {
@@ -56,50 +58,43 @@ fn main() -> Result<()> {
     info!("{}", UUID);
 
     let tps_config = TempSensorConfig::default();
-    let mut tp_driver = TempSensorDriver::new(&tps_config, peripherals.temp_sensor).unwrap();
+    let mut tp_driver = TempSensorDriver::new(&tps_config, peripherals.temp_sensor)?;
 
     tp_driver.enable()?;
 
     let pins = peripherals.pins;
-    let sda = pins.gpio6;
-    let scl = pins.gpio7;
-    let i2c = peripherals.i2c0;
-    let config = I2cConfig::new().baudrate(100.kHz().into());
-    let i2c = I2cDriver::new(i2c, sda, scl, &config)?;
+    let (mut bme280_sensor, delay) = 
+        setup_bme280_temp_hum_airpr_sensor(
+            peripherals.i2c0, pins.gpio6, pins.gpio7
+        )?;
 
-    let mut bme280_sensor = BME280::new_primary(i2c);
-    let mut delay = Delay::new(10);
-
-    if let Err(e) = bme280_sensor.init(&mut delay) {
-        panic!("bme280 sensor init failed for I2C!: error: {:?}", e);
+    let adc = AdcDriver::new(peripherals.adc1)?;
+    let mut co2_sensor_adc_pin = if app_config.feature_co2_sensor_active {
+        Some(setup_co2_sensor(
+            &adc, pins.gpio4
+        )?)
     }
-
-    info!("gpio4 adc channel: {}", pins.gpio4.adc_channel());
-
-    let adc = AdcDriver::new(peripherals.adc1).unwrap();
-    let adc_config = AdcChannelConfig{
-        attenuation: DB_11, 
-        calibration: Calibration::None,
-        resolution: Resolution::Resolution12Bit,
-        //..Default::default()
+    else{
+        None
     };
 
-    let mut adc_pin //: AdcChannelDriver<'_, AdcDriver<'_, ADC1>> 
-        = 
-        AdcChannelDriver::new(
-        &adc, pins.gpio4, &adc_config
-    ).unwrap();
+    let mut client = setup_mqtt_client(&app_config)?;
 
+    loop {
+        sleep(Duration::from_secs(60));
+        publish_chip_temperature(&mut client, &tp_driver)?;
+        let (t, h) = publish_bme280_measurements(&mut client, &mut bme280_sensor, delay)?;
 
-    let mut co2_sensor = Mq135::new(
-         20.0
-    ); // RL load resistance in kOhms
+        if app_config.feature_co2_sensor_active {
+            let (co2_sensor, adc_pin) = &mut co2_sensor_adc_pin.as_mut().unwrap();
+            read_publish_mq135_co2(
+                &mut client, co2_sensor, &adc, adc_pin, t, h
+            )?;
+        }
+    }
+}
 
-        sleep(Duration::from_secs(1));
-        co2_sensor.calibrate_in_clean_air(&adc, &mut adc_pin).unwrap();
-        let (co2_ppm, adc_val) = co2_sensor.read_gas_ppm(GasType::CO2, &adc, &mut adc_pin).unwrap();
-        info!("CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_val);
-
+fn setup_mqtt_client(app_config: &Config) -> Result<EspMqttClient<'static>, EspError>{
     // Client configuration:
     let broker_url = if app_config.mqtt_user != "" {
         format!(
@@ -115,22 +110,71 @@ fn main() -> Result<()> {
     // Your Code:
 
     // 1. Create a client with default configuration and empty handler
-    let mut client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |_message_event| {
+    let client = EspMqttClient::new_cb(&broker_url, &mqtt_config, move |_message_event| {
         // handler code
-    })?;
+    });
+    client
+}
 
-    loop {
-        sleep(Duration::from_secs(1));
-        publish_chip_temperature(&mut client, &tp_driver)?;
-        let (t, h) = publish_bme280_measurements(&mut client, &mut bme280_sensor, delay)?;
+fn setup_bme280_temp_hum_airpr_sensor(
+    i2c: I2C0, sda_gpio6: Gpio6, scl_gpio7: Gpio7
+) -> Result<(BME280<I2cDriver<'static>>, Delay)> {
+    let config = I2cConfig::new().baudrate(100.kHz().into());
+    let i2c = I2cDriver::new(i2c, sda_gpio6, scl_gpio7, &config)?;
 
-        let (co2_ppm, adc_val) = co2_sensor.read_gas_ppm(GasType::CO2, &adc, &mut adc_pin).unwrap();
+    let mut bme280_sensor = BME280::new_primary(i2c);
+    let mut delay = Delay::new(10);
+
+    if let Err(e) = bme280_sensor.init(&mut delay) {
+        panic!("bme280 sensor init failed for I2C!: error: {:?}", e);
+    }
+    Ok((bme280_sensor, delay))
+}
+
+fn setup_co2_sensor<'d>(
+    adc_driver: &'d AdcDriver<'d, ADC1>,
+    co2_measure_pin_gpio4: Gpio4
+) -> anyhow::Result<(Mq135,  AdcChannelDriver<'d, Gpio4, &'d AdcDriver<'d, ADC1>>)>{
+    info!("gpio4 adc channel: {}", co2_measure_pin_gpio4.adc_channel());
+
+    let adc_config = AdcChannelConfig{
+        attenuation: DB_11, 
+        calibration: Calibration::None,
+        resolution: Resolution::Resolution12Bit,
+    };
+
+    let mut adc_pin  = 
+        AdcChannelDriver::new(
+        adc_driver, co2_measure_pin_gpio4, &adc_config
+    )?;
+
+    let mut co2_sensor = Mq135::new(
+         20.0
+    ); // RL load resistance in kOhms
+
+    sleep(Duration::from_secs(1));
+    co2_sensor.calibrate_in_clean_air(&adc_driver, &mut adc_pin)?;
+    let (co2_ppm, adc_val) = co2_sensor.read_gas_ppm(
+        GasType::CO2, adc_driver, &mut adc_pin
+    )?;
+
+    info!("CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_val);
+    Ok((co2_sensor, adc_pin))
+}
+
+fn read_publish_mq135_co2<'d>(
+    client: &mut EspMqttClient,
+    co2_sensor: &mut Mq135,
+    adc: &AdcDriver<'d, ADC1>,
+    adc_pin: &mut AdcChannelDriver<'d, Gpio4, &AdcDriver<'d, ADC1>>,
+    t: f32, h: f32
+) -> Result<()>
+{
+        let (co2_ppm, adc_val) = co2_sensor.read_gas_ppm(GasType::CO2, adc, adc_pin).unwrap();
         info!("CO2 Concentration: {} ppm; adc val: {}", co2_ppm, adc_val);
 
-        let adc_value: u32 = adc.read(&mut adc_pin)?.into();
-        publish_mq135_co2(&mut client, &co2_sensor, adc_value, t, h)?;
-
-    }
+        let adc_value: u32 = adc.read(adc_pin)?.into();
+        publish_mq135_co2(client, co2_sensor, adc_value, t, h)
 }
 
 fn publish_mq135_co2(
