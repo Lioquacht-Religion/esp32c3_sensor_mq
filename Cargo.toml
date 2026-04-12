@@ -1,13 +1,16 @@
 [package]
-name = "esp32c3_sensor_mq_publ"
+name = "esp32c3_sensor_mq"
 version = "0.1.0"
 authors = ["Lioquacht-Religion <basik0010@gmail.com>"]
 edition = "2021"
 resolver = "2"
-rust-version = "1.77"
+rust-version = "1.97"
 
 [[bin]]
-name = "esp32c3_sensor_mq_publ"
+name = "esp32c3_sensor_mq"
+harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+
+[lib]
 harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
 
 [profile.release]
@@ -24,9 +27,11 @@ experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
 log           = "0.4"
-esp-idf-svc   = "0.51"
-anyhow        = "=1.0.95"
+embedded-hal  = "0.2.7"
 embedded-svc  = "=0.28.1"
+# esp-idf-svc   = "0.51"
+esp-idf-svc   = "0.52.1"
+anyhow        = "=1.0.95"
 get-uuid      = { path = "common/lib/get-uuid" }
 
 libm = "0.2.15"
