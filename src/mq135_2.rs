@@ -72,10 +72,7 @@ impl Mq135 {
     /// # Returns
     /// * `Ok(())` on success.
     /// * `Err(Error)` if the ADC reading fails.
-    pub fn calibrate_in_clean_air(
-        &mut self,
-        adc_value: u16
-    ) -> anyhow::Result<()> {
+    pub fn calibrate_in_clean_air(&mut self, adc_value: u16) -> anyhow::Result<()> {
         //let voltage = adc_value as f32 / 4095.0 * 3.3;
         let voltage = adc_value as f32 / 4096.0 * 5.0;
 
@@ -93,11 +90,7 @@ impl Mq135 {
     /// # Returns
     /// * `Ok(ppm)` where `ppm` is the parts-per-million value of the gas.
     /// * `Err(Error)` if the ADC reading fails.
-    pub fn read_gas_ppm(
-        &mut self,
-        gas: GasType,
-        adc_value: u16,
-    ) -> anyhow::Result<(f32, u32)> {
+    pub fn read_gas_ppm(&mut self, gas: GasType, adc_value: u16) -> anyhow::Result<(f32, u32)> {
         let adc_value: u32 = adc_value.into();
 
         let voltage = adc_value as f32 / 4095.0 * 3.3;
