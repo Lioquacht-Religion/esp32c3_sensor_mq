@@ -29,7 +29,7 @@ use esp_idf_svc::{
     sys::EspError,
     wifi::BlockingWifi,
 };
-use log::info;
+use log::{error, info};
 use schili_api::{api, mq_topics::TOPICS};
 use std::{thread::sleep, time::Duration};
 
@@ -54,7 +54,6 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     // Configure Wakeup Sources
-    //let deep_sleep = DeepSleep::new()?.wakeup_on_timer(std::time::Duration::from_mins(5))?;
     let mut light_sleep = LightSleep::new()?.wakeup_on_timer(std::time::Duration::from_mins(5))?;
 
     loop {
@@ -109,9 +108,6 @@ fn main() -> Result<()> {
         //TODO: publish errors to queue before returning an error,
         // to inform main service the sensor has problems
         publish_chip_temperature(&mut client, &tp_driver)?;
-        // first measurement is always wrong
-        // TODO: take multiple measurements, to get avg temp
-        // remove outliers from calc
         let (t, h) = publish_bme280_measurements(&mut client, &mut bme280_sensor, delay)?;
 
         let mut batt_v = 0;
@@ -185,10 +181,10 @@ fn setup_bme280_temp_hum_airpr_sensor(
     let mut bme280_sensor = BME280::new_primary(i2c);
     let mut delay = Delay::new(10);
 
-    if let Err(e) = bme280_sensor.init(&mut delay) {
-        panic!("bme280 sensor init failed for I2C!: error: {:?}", e);
+    match bme280_sensor.init(&mut delay) {
+        Err(e) => Err(anyhow!("bme280 sensor init failed for I2C!: error: {:?}", e).into()),
+        Ok(()) => Ok((bme280_sensor, delay)),
     }
-    Ok((bme280_sensor, delay))
 }
 
 fn setup_co2_sensor<'d>(adc_value: u16) -> anyhow::Result<Mq135> {
