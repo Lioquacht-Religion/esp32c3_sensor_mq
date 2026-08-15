@@ -10,27 +10,24 @@ use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
     hal::{
         adc::{
-            attenuation::DB_12,
-            oneshot::{
-                config::{AdcChannelConfig, Calibration},
-                AdcChannelDriver, AdcDriver,
-            },
-            Resolution,
+            ADC1, Resolution, attenuation::DB_12, oneshot::{
+                AdcChannelDriver, AdcDriver, config::{AdcChannelConfig, Calibration}
+            }
         },
         delay::Delay,
-        gpio::{Gpio6, Gpio7},
-        i2c::{I2cConfig, I2cDriver, I2cError, I2C0},
+        gpio::{Gpio6, Gpio7, Pins},
+        i2c::{I2C0, I2cConfig, I2cDriver, I2cError},
         peripherals::Peripherals,
         sleep::LightSleep,
-        temp_sensor::{TempSensorConfig, TempSensorDriver},
+        temp_sensor::{TempSensor, TempSensorConfig, TempSensorDriver},
         units::Hertz,
     },
     mqtt::client::{EspMqttClient, MqttClientConfiguration, QoS},
     sys::EspError,
     wifi::BlockingWifi,
 };
-use log::{error, info};
-use schili_api::{api, mq_topics::TOPICS};
+use log::info;
+use schili_api::{api::{self}, mq_topics::TOPICS};
 use std::{thread::sleep, time::Duration};
 
 #[toml_cfg::toml_config]
@@ -52,12 +49,15 @@ pub struct Config {
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    measure_loop()
+}
 
+fn measure_loop() -> Result<()> {
     // Configure Wakeup Sources
     let mut light_sleep = LightSleep::new()?.wakeup_on_timer(std::time::Duration::from_mins(5))?;
 
     loop {
-        sleep(std::time::Duration::from_secs(1));
+        sleep(std::time::Duration::from_millis(10));
 
         let peripherals = Peripherals::take().unwrap();
         let sysloop = EspSystemEventLoop::take()?;
@@ -66,72 +66,31 @@ fn main() -> Result<()> {
         let app_config = CONFIG;
 
         // Connect to the Wi-Fi network
-        let mut wifi = wifi(
-            app_config.wifi_ssid,
-            app_config.wifi_psk,
-            peripherals.modem,
-            sysloop.clone(),
-        )?;
-
-        let tps_config = TempSensorConfig::default();
-        let mut tp_driver = TempSensorDriver::new(&tps_config, peripherals.temp_sensor)?;
-
-        tp_driver.enable()?;
-
-        let pins = peripherals.pins;
-        let (mut bme280_sensor, delay) =
-            setup_bme280_temp_hum_airpr_sensor(peripherals.i2c0, pins.gpio6, pins.gpio7)?;
-
-        let adc = AdcDriver::new(peripherals.adc1)?;
-
-        let adc_config = AdcChannelConfig {
-            attenuation: DB_12,
-            calibration: Calibration::None,
-            resolution: Resolution::Resolution12Bit,
-        };
-
-        let mut adc_pin = AdcChannelDriver::new(&adc, pins.gpio4, &adc_config)?;
-
-        let mut co2_sensor = if app_config.feature_co2_sensor_active {
-            let co2_adc_val = adc.read(&mut adc_pin)?;
-            Some(setup_co2_sensor(co2_adc_val)?)
-        } else {
-            None
-        };
-
-        let mut battery_volt_adc_pin = AdcChannelDriver::new(&adc, pins.gpio0, &adc_config)?;
-        let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
-        info!("battery voltage: {}", adc_value);
+        let (mut wifi, connect_errors) = wifi(
+                    app_config.wifi_ssid,
+                    app_config.wifi_psk,
+                    peripherals.modem,
+                    sysloop.clone()
+                )?;
 
         let mut client = setup_mqtt_client(&app_config)?;
-
-        //TODO: publish errors to queue before returning an error,
-        // to inform main service the sensor has problems
-        publish_chip_temperature(&mut client, &tp_driver)?;
-        let (t, h) = publish_bme280_measurements(&mut client, &mut bme280_sensor, delay)?;
-
-        let mut batt_v = 0;
-        for _i in 0..16 {
-            let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
-            batt_v += adc_value; // ADC with correction
-        }
-        let batt_v_f = 2. * batt_v as f32 / 16. / 1000.0; // attenuation ratio 1/2, mV --> V
-        info!("battery voltage corrected: {}", batt_v_f);
-        publish_simple_measurement(
-            &mut client,
-            &TOPICS.battery_voltage,
-            "battery voltage",
-            batt_v_f,
-        )?;
-
-        if app_config.feature_co2_sensor_active {
-            let co2_sensor = &mut co2_sensor.as_mut().unwrap();
-            let co2_adc_val = adc.read(&mut adc_pin)?;
-            read_publish_mq135_co2(&mut client, co2_sensor, co2_adc_val, t, h)?;
+        for e in connect_errors{
+            publish_sensor_error_log_err(&mut client, e);
         }
 
-        //wait for data to be send
-        sleep(std::time::Duration::from_secs(2));
+        if let Err(e) = measure_and_publish(
+            &app_config, &mut client, 
+            peripherals.temp_sensor, peripherals.i2c0, 
+            peripherals.adc1, peripherals.pins
+        ){
+            publish_sensor_error_log_err(&mut client, e);
+        }
+
+        // wait for data to be send
+        // the wait time needs to be relatively long
+        // 50 ms was not enough, so increased it to half a second
+        // otherwise the chip will go to sleep before data could be send
+        sleep(std::time::Duration::from_millis(500));
 
         // deactivate mqtt client and wifi before going into sleep
         let mut wifi = BlockingWifi::wrap(wifi.as_mut(), sysloop.clone())?;
@@ -141,11 +100,9 @@ fn main() -> Result<()> {
         wifi.stop()?;
 
         // wait for wifi to stop
-        sleep(std::time::Duration::from_secs(2));
+        sleep(std::time::Duration::from_millis(100));
         light_sleep.enter()?;
     }
-
-    //deep_sleep.enter();
 }
 
 fn setup_mqtt_client(app_config: &Config) -> Result<EspMqttClient<'static>, EspError> {
@@ -168,6 +125,69 @@ fn setup_mqtt_client(app_config: &Config) -> Result<EspMqttClient<'static>, EspE
         // handler code
     });
     client
+}
+
+fn measure_and_publish(
+    app_config: &Config,
+    client: &mut EspMqttClient,
+    temp_sensor: TempSensor<'static>,
+    i2c0: I2C0<'static>,
+    adc1: ADC1<'static>,
+    pins: Pins,
+) -> Result<()>{
+        let tps_config = TempSensorConfig::default();
+        let mut tp_driver = TempSensorDriver::new(&tps_config, temp_sensor)?;
+
+        tp_driver.enable()?;
+
+        let (mut bme280_sensor, delay) =
+            setup_bme280_temp_hum_airpr_sensor(i2c0, pins.gpio6, pins.gpio7)?;
+
+        let adc = AdcDriver::new(adc1)?;
+
+        let adc_config = AdcChannelConfig {
+            attenuation: DB_12,
+            calibration: Calibration::None,
+            resolution: Resolution::Resolution12Bit,
+        };
+
+        let mut adc_pin = AdcChannelDriver::new(&adc, pins.gpio4, &adc_config)?;
+
+        let mut co2_sensor = if app_config.feature_co2_sensor_active {
+            let co2_adc_val = adc.read(&mut adc_pin)?;
+            Some(setup_co2_sensor(co2_adc_val)?)
+        } else {
+            None
+        };
+
+        let mut battery_volt_adc_pin = AdcChannelDriver::new(&adc, pins.gpio0, &adc_config)?;
+        let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
+        info!("battery voltage: {}", adc_value);
+
+        publish_chip_temperature(client, &tp_driver)?;
+        let (t, h) = publish_bme280_measurements(client, &mut bme280_sensor, delay)?;
+
+        let mut batt_v = 0;
+        for _i in 0..16 {
+            let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
+            batt_v += adc_value; // ADC with correction
+        }
+        let batt_v_f = 2. * batt_v as f32 / 16. / 1000.0; // attenuation ratio 1/2, mV --> V
+        info!("battery voltage corrected: {}", batt_v_f);
+        publish_simple_measurement(
+            client,
+            &TOPICS.battery_voltage,
+            "battery voltage",
+            batt_v_f,
+        )?;
+
+        if app_config.feature_co2_sensor_active {
+            let co2_sensor = &mut co2_sensor.as_mut().unwrap();
+            let co2_adc_val = adc.read(&mut adc_pin)?;
+            read_publish_mq135_co2(client, co2_sensor, co2_adc_val, t, h)?;
+        }
+
+        Ok(())
 }
 
 fn setup_bme280_temp_hum_airpr_sensor(
@@ -327,5 +347,36 @@ fn publish_simple_measurement(
     client
         .enqueue(topic, QoS::AtLeastOnce, false, &sens_temps_str.as_bytes())
         .map_err(|e| anyhow!("Could not send bme280 {name}. error: {e}"))?;
+    Ok(())
+}
+fn publish_sensor_error_log_err(
+    client: &mut EspMqttClient,
+    error: anyhow::Error,
+) {
+            if let Err(e) = publish_sensor_error(client, &TOPICS.error, error){
+                log::error!("Error while trying to publish sensor error: {}", e);
+            }
+}
+
+fn publish_sensor_error(
+    client: &mut EspMqttClient,
+    topic: &'static str,
+    error: anyhow::Error,
+) -> Result<()> {
+    info!("sensor error: {}", error.root_cause());
+
+    let sensor_error= api::SensorError{
+        sensor_reference: "bme280_1".into(),
+        error: api::Error{
+            error_code: api::ErrorCode::PlaceHolder,
+            error_text: error.root_cause().to_string(),
+            error_time: Utc::now(),
+        }
+    };
+
+    let sensor_error_str = serde_json::to_string(&sensor_error)?;
+    client
+        .enqueue(topic, QoS::AtLeastOnce, false, &sensor_error_str.as_bytes())
+        .map_err(|e| anyhow!("Could not send sensor error. error: {e}"))?;
     Ok(())
 }
