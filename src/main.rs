@@ -27,7 +27,7 @@ use esp_idf_svc::{
     wifi::BlockingWifi,
 };
 use log::info;
-use schili_api::{api::{self}, mq_topics::TOPICS};
+use schili_api::{api::{self, SensorType}, mq_topics::TOPICS};
 use std::{thread::sleep, time::Duration};
 
 #[toml_cfg::toml_config]
@@ -164,8 +164,8 @@ fn measure_and_publish(
         let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
         info!("battery voltage: {}", adc_value);
 
-        publish_chip_temperature(client, &tp_driver)?;
-        let (t, h) = publish_bme280_measurements(client, &mut bme280_sensor, delay)?;
+        let chip_temp = measure_chip_temperature(&tp_driver)?;
+        let (t, h, ap) = measure_bme280_values(&mut bme280_sensor, delay)?;
 
         let mut batt_v = 0;
         for _i in 0..16 {
@@ -173,13 +173,19 @@ fn measure_and_publish(
             batt_v += adc_value; // ADC with correction
         }
         let batt_v_f = 2. * batt_v as f32 / 16. / 1000.0; // attenuation ratio 1/2, mV --> V
+        const RES1 : f32 = 1000.;
+        const RES2 : f32 = 4100.;
+        let batt_v_f = calc_volt_divider_in(RES1, RES2, batt_v_f);
         info!("battery voltage corrected: {}", batt_v_f);
-        publish_simple_measurement(
-            client,
-            &TOPICS.battery_voltage,
-            "battery voltage",
-            batt_v_f,
-        )?;
+        let battery_volt = create_measurement(SensorType::BatteryVoltage, batt_v_f);
+
+        publish_simple_measurements(client, vec![
+            chip_temp,
+            battery_volt,
+            create_measurement(SensorType::Temperature, t),
+            create_measurement(SensorType::Humidity, h),
+            create_measurement(SensorType::Airpressure, ap),
+        ])?;
 
         if app_config.feature_co2_sensor_active {
             let co2_sensor = &mut co2_sensor.as_mut().unwrap();
@@ -188,6 +194,22 @@ fn measure_and_publish(
         }
 
         Ok(())
+}
+
+/// voltage divider formula:
+///   Vout = Vin * (R1 / (R1 + R2))
+/// to solve for Vin:
+///   Vin = Vout / (R1 / (R1 + R2))
+///
+/// PANIC: 
+/// Input parameter res1 should not be zero
+/// otherwise division by zero occurs.
+/// Input parameters res1 and res2
+/// added together should not equal zero,
+/// otherwise division by zero occurs.
+fn calc_volt_divider_in(res1: f32, res2: f32, volt_out: f32) -> f32{
+    // Vin
+    volt_out / ( res1 / (res1 + res2) )
 }
 
 fn setup_bme280_temp_hum_airpr_sensor(
@@ -269,26 +291,22 @@ fn publish_mq135_co2(
     Ok(())
 }
 
-fn publish_chip_temperature(
-    client: &mut EspMqttClient,
+fn measure_chip_temperature(
     tp_driver: &TempSensorDriver,
-) -> Result<()> {
+) -> Result<api::SensorTypedSimpleMeasurement> {
+    // measure chip temperature
     let temp_val = tp_driver
         .get_celsius()
         .map_err(|e| anyhow!("Could not access chip temperature. error: {e}"))?;
     info!("chip temperature: {}", temp_val);
 
-    // publish CPU temperature
-    publish_simple_measurement(client, &TOPICS.chip_temp, "chip temperature", temp_val)?;
-
-    Ok(())
+    Ok(create_measurement(SensorType::ChipTemperature, temp_val))
 }
 
-fn publish_bme280_measurements(
-    client: &mut EspMqttClient,
+fn measure_bme280_values(
     bme280_sensor: &mut BME280<I2cDriver>,
     mut delay: Delay,
-) -> Result<(f32, f32)> {
+) -> Result<(f32, f32, f32)> {
     // measure multiple times, sort the results and choose
     // the mid value,
     // because the first measurements after the microcontroller 
@@ -319,36 +337,34 @@ fn publish_bme280_measurements(
         pressure,
         ..
     } = mid;
-    publish_simple_measurement(client, &TOPICS.temp, "temperature", temperature)?;
-    publish_simple_measurement(client, &TOPICS.humidity, "humidity", humidity)?;
-    publish_simple_measurement(client, &TOPICS.air_pressure, "air pressure", pressure)?;
-    return Ok((temperature, humidity));
+    Ok((temperature, humidity, pressure))
 }
 
-fn publish_simple_measurement(
+fn publish_simple_measurements(
     client: &mut EspMqttClient,
-    topic: &str,
-    name: &str,
-    measurement: f32,
+    measurements: Vec<api::SensorTypedSimpleMeasurement>,
 ) -> Result<()> {
-    info!("sensor {name}: {measurement}");
-
-    let temp = api::SimpleMeasurement {
-        measurement: BigDecimal::from_f32(measurement)
-            .expect("f32 could not be parsed to BigDecimal."),
-        measure_time: Utc::now(),
-    };
-    let sens_temps = api::SensorSingleSimpleMeasure {
+    let sens_temps = api::SensorTypedSimpleMeasurements{
         sensor_reference: "bme280_1".into(),
-        measure: temp,
+        measurements
     };
 
     let sens_temps_str = serde_json::to_string(&sens_temps)?;
     client
-        .enqueue(topic, QoS::AtLeastOnce, false, &sens_temps_str.as_bytes())
-        .map_err(|e| anyhow!("Could not send bme280 {name}. error: {e}"))?;
+        .enqueue(&TOPICS.measurement_bundle, QoS::AtLeastOnce, false, &sens_temps_str.as_bytes())
+        .map_err(|e| anyhow!("Could not send bme280 measurements. error: {e}"))?;
     Ok(())
 }
+
+fn create_measurement(sensor_type: SensorType, measurement: f32) -> api::SensorTypedSimpleMeasurement{
+    let measurement = api::SimpleMeasurement {
+        measurement: BigDecimal::from_f32(measurement)
+            .expect("f32 could not be parsed to BigDecimal."),
+        measure_time: Utc::now(),
+    };
+    api::SensorTypedSimpleMeasurement { sensor_type, measure: measurement}
+}
+
 fn publish_sensor_error_log_err(
     client: &mut EspMqttClient,
     error: anyhow::Error,
