@@ -53,9 +53,6 @@ fn main() -> Result<()> {
 }
 
 fn measure_loop() -> Result<()> {
-    // Configure Wakeup Sources
-    let mut light_sleep = LightSleep::new()?.wakeup_on_timer(std::time::Duration::from_mins(5))?;
-
     loop {
         sleep(std::time::Duration::from_millis(10));
 
@@ -78,10 +75,12 @@ fn measure_loop() -> Result<()> {
             publish_sensor_error_log_err(&mut client, e);
         }
 
+        let mut sleep_dur = std::time::Duration::from_mins(5);
+
         if let Err(e) = measure_and_publish(
             &app_config, &mut client, 
             peripherals.temp_sensor, peripherals.i2c0, 
-            peripherals.adc1, peripherals.pins
+            peripherals.adc1, peripherals.pins, &mut sleep_dur
         ){
             publish_sensor_error_log_err(&mut client, e);
         }
@@ -101,6 +100,10 @@ fn measure_loop() -> Result<()> {
 
         // wait for wifi to stop
         sleep(std::time::Duration::from_millis(100));
+        // Configure Wakeup Sources
+        let mut light_sleep = LightSleep::new()?
+            .wakeup_on_timer(sleep_dur)?;
+
         light_sleep.enter()?;
     }
 }
@@ -134,6 +137,7 @@ fn measure_and_publish(
     i2c0: I2C0<'static>,
     adc1: ADC1<'static>,
     pins: Pins,
+    sleep_dur: &mut std::time::Duration,
 ) -> Result<()>{
         let tps_config = TempSensorConfig::default();
         let mut tp_driver = TempSensorDriver::new(&tps_config, temp_sensor)?;
@@ -160,24 +164,42 @@ fn measure_and_publish(
             None
         };
 
-        let mut battery_volt_adc_pin = AdcChannelDriver::new(&adc, pins.gpio0, &adc_config)?;
-        let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
-        info!("battery voltage: {}", adc_value);
-
         let chip_temp = measure_chip_temperature(&tp_driver)?;
         let (t, h, ap) = measure_bme280_values(&mut bme280_sensor, delay)?;
+
+        let mut battery_volt_adc_pin = AdcChannelDriver::new(&adc, pins.gpio2, &adc_config)?;
+        let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
+        info!("battery voltage: {}", adc_value);
 
         let mut batt_v = 0;
         for _i in 0..16 {
             let adc_value: u32 = adc.read(&mut battery_volt_adc_pin)?.into();
             batt_v += adc_value; // ADC with correction
         }
-        let batt_v_f = 2. * batt_v as f32 / 16. / 1000.0; // attenuation ratio 1/2, mV --> V
-        const RES1 : f32 = 1000.;
-        const RES2 : f32 = 4100.;
-        let batt_v_f = calc_volt_divider_in(RES1, RES2, batt_v_f);
-        info!("battery voltage corrected: {}", batt_v_f);
-        let battery_volt = create_measurement(SensorType::BatteryVoltage, batt_v_f);
+        let batt_v = batt_v as f32 / 16.; 
+        // attenuation ratio (12 dB; 25%), mV --> V
+        let batt_v = calc_adc_volt_in(batt_v, 12, 1100., 0.25) / 1000.;
+        const RES1 : f32 = 4100.;
+        const RES2 : f32 = 1000.;
+        let batt_v = calc_volt_divider_in(RES1, RES2, batt_v);
+        info!("battery voltage corrected: {}", batt_v);
+        let battery_volt = create_measurement(SensorType::BatteryVoltage, batt_v);
+
+        let mut light_intensity_adc_pin = AdcChannelDriver::new(&adc, pins.gpio3, &adc_config)?;
+        let adc_value: u32 = adc.read(&mut light_intensity_adc_pin)?.into();
+        info!("light intensity: {}", adc_value);
+
+        let mut light_intensity = 0;
+        for _i in 0..16 {
+            let adc_value: u32 = adc.read(&mut light_intensity_adc_pin)?.into();
+            light_intensity += adc_value; // ADC with correction
+        }
+        // attenuation ratio (12 dB; 25%), mV --> V
+        let light_intensity = light_intensity as f32 / 16.;
+        info!("light intensity corrected: {}", light_intensity);
+        if light_intensity < 1000. {
+            *sleep_dur = std::time::Duration::from_hours(1);
+        }
 
         publish_simple_measurements(client, vec![
             chip_temp,
@@ -185,6 +207,7 @@ fn measure_and_publish(
             create_measurement(SensorType::Temperature, t),
             create_measurement(SensorType::Humidity, h),
             create_measurement(SensorType::Airpressure, ap),
+            create_measurement(SensorType::LightIntensity, light_intensity),
         ])?;
 
         if app_config.feature_co2_sensor_active {
@@ -197,19 +220,25 @@ fn measure_and_publish(
 }
 
 /// voltage divider formula:
-///   Vout = Vin * (R1 / (R1 + R2))
+///   Vout = Vin * (R2 / (R1 + R2))
 /// to solve for Vin:
-///   Vin = Vout / (R1 / (R1 + R2))
+///   Vin = Vout / (R2 / (R1 + R2))
 ///
 /// PANIC: 
-/// Input parameter res1 should not be zero
+/// Input parameter res2 should not be zero
 /// otherwise division by zero occurs.
 /// Input parameters res1 and res2
 /// added together should not equal zero,
 /// otherwise division by zero occurs.
 fn calc_volt_divider_in(res1: f32, res2: f32, volt_out: f32) -> f32{
     // Vin
-    volt_out / ( res1 / (res1 + res2) )
+    volt_out / ( res2 / (res1 + res2) )
+}
+
+fn calc_adc_volt_in(data_adc_val: f32, bitwidth: u32, volt_ref: f32, attenuation: f32) -> f32{
+    (volt_ref / attenuation as f32)
+        * (data_adc_val / 
+            (2_u32.pow(bitwidth) - 1) as f32)
 }
 
 fn setup_bme280_temp_hum_airpr_sensor(
