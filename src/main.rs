@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use bigdecimal::{BigDecimal, FromPrimitive};
 use bme280::{i2c::BME280, Measurements};
 use chrono::Utc;
+use embedded_svc::mqtt::client::MessageId;
 use esp32c3_sensor_mq::{
     mq135_2::{GasType, Mq135},
     wifi::wifi,
@@ -89,7 +90,7 @@ fn measure_loop() -> Result<()> {
         // the wait time needs to be relatively long
         // 50 ms was not enough, so increased it to half a second
         // otherwise the chip will go to sleep before data could be send
-        sleep(std::time::Duration::from_millis(500));
+        sleep(std::time::Duration::from_secs(1));
 
         // deactivate mqtt client and wifi before going into sleep
         let mut wifi = BlockingWifi::wrap(wifi.as_mut(), sysloop.clone())?;
@@ -309,7 +310,7 @@ fn publish_mq135_co2(
     };
     if let Ok(sens_temps_str) = serde_json::to_string(&sensor_co2_measure) {
         client
-            .enqueue(
+            .publish(
                 &TOPICS.co2,
                 QoS::AtLeastOnce,
                 false,
@@ -372,17 +373,17 @@ fn measure_bme280_values(
 fn publish_simple_measurements(
     client: &mut EspMqttClient,
     measurements: Vec<api::SensorTypedSimpleMeasurement>,
-) -> Result<()> {
+) -> Result<MessageId> {
     let sens_temps = api::SensorTypedSimpleMeasurements{
         sensor_reference: "bme280_1".into(),
         measurements
     };
 
     let sens_temps_str = serde_json::to_string(&sens_temps)?;
-    client
-        .enqueue(&TOPICS.measurement_bundle, QoS::AtLeastOnce, false, &sens_temps_str.as_bytes())
+    let msg_id = client
+        .publish(&TOPICS.measurement_bundle, QoS::AtLeastOnce, false, &sens_temps_str.as_bytes())
         .map_err(|e| anyhow!("Could not send bme280 measurements. error: {e}"))?;
-    Ok(())
+    Ok(msg_id)
 }
 
 fn create_measurement(sensor_type: SensorType, measurement: f32) -> api::SensorTypedSimpleMeasurement{
@@ -421,7 +422,7 @@ fn publish_sensor_error(
 
     let sensor_error_str = serde_json::to_string(&sensor_error)?;
     client
-        .enqueue(topic, QoS::AtLeastOnce, false, &sensor_error_str.as_bytes())
+        .publish(topic, QoS::AtLeastOnce, false, &sensor_error_str.as_bytes())
         .map_err(|e| anyhow!("Could not send sensor error. error: {e}"))?;
     Ok(())
 }
