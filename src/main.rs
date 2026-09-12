@@ -149,7 +149,7 @@ fn measure_loop(peripherals: &mut Peripherals) -> Result<()> {
                 stop_mqtt_client_and_wifi(wifi, mqtt_client, sysloop.clone())?;
             }
             Ok(m) => {
-                if m.light_intensity < 100. || m.battery_voltage < 3.0 {
+                if m.light_intensity < 100. || m.battery_voltage < 3.5 {
                     sleep_dur = std::time::Duration::from_mins(5);
                     stored_measurements.push(m);
                     if stored_measurements.len() >= MAX_STORED_MEASUREMENTS {
@@ -400,31 +400,36 @@ fn publish_measurements<'m, 'i: 'm>(
     client: &mut EspMqttClient,
     measurements: &[MeasurementsF32],
 ) -> Result<()> {
-    for m in measurements.iter() {
-        let &MeasurementsF32 {
-            temperature,
-            humidity,
-            air_pressure,
-            chip_temperature,
-            light_intensity,
-            battery_voltage,
-            measure_time,
-        } = m;
+        let mut measurements2 = Vec::with_capacity(measurements.len()*6);
+        for m in measurements.iter(){
+            let &MeasurementsF32 {
+                temperature,
+                humidity,
+                air_pressure,
+                chip_temperature,
+                light_intensity,
+                battery_voltage,
+                measure_time,
+            } = m;
+            info!("publish measure: {m:?}...");
 
-        info!("publish measure: {m:?}...");
-        publish_simple_measurements(
-            client,
-            &[
+
+            [
                 create_measurement_f32(SensorType::Temperature, temperature, measure_time),
                 create_measurement_f32(SensorType::Humidity, humidity, measure_time),
                 create_measurement_f32(SensorType::Airpressure, air_pressure, measure_time),
                 create_measurement_f32(SensorType::ChipTemperature, chip_temperature, measure_time),
                 create_measurement_f32(SensorType::LightIntensity, light_intensity, measure_time),
                 create_measurement_f32(SensorType::BatteryVoltage, battery_voltage, measure_time),
-            ],
+            ].into_iter().for_each(|m| measurements2.push(m));
+
+        }
+
+        publish_simple_measurements(
+            client,
+            &measurements2,
         )?;
         info!("...published");
-    }
 
     /*
      * TODO
